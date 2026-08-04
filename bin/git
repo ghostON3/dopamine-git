@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# git — dopamine-git PATH shim.
+#
+# This sits earlier in PATH than the real git and announces what happened.
+# It is the only mechanism that hears an AI agent: agents shell out to `git`
+# through PATH, so they hit this. A zsh function never applies to them, and
+# git has no hook at all for `add` or `worktree`.
+#
+# CONTRACT — this file wraps every git invocation on the machine, so it must be
+# incapable of changing git's behaviour:
+#   * stdin/stdout/stderr are passed through untouched
+#   * git's exit code is always preserved and returned
+#   * the sound is fire-and-forget in the background; it never blocks or delays
+#   * any failure inside this script is swallowed — git still runs
+#   * no `set -e`: a bug here must never abort someone's commit
+#
+# Escape hatches:
+#   DOPAMINE_GIT_OFF=1   bypass entirely for one command or one shell
+#   SFX_MUTE=1           run, but stay silent
+
+# Recursion guard: sfx itself calls `git rev-parse` for repo/branch context,
+# and that call would land right back here.
+if [[ -n "${SFX_IN_SHIM:-}" ]]; then
+  exec /usr/bin/git "$@"
+fi
+
+# Find the real git: the first one in PATH that is not this script.
+_dg_real_git() {
+  local self me d c
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  local IFS=:
+  for d in $PATH; do
+    c="$d/git"
+    [[ -x "$c" && ! -d "$c" ]] || continue
+    me="$(cd "$d" 2>/dev/null && pwd)/git"
+    [[ "$me" == "$self" ]] && continue
+    printf '%s' "$c"
+    return 0
+  done
+  # Last resort: the usual suspects.
+  for c in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
+    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+REAL_GIT="$(_dg_real_git)" || { echo "git: not found" >&2; exit 127; }
+
+# Bypass: run git and get out of the way.
+if [[ "${DOPAMINE_GIT_OFF:-0}" == "1" ]]; then
+  exec "$REAL_GIT" "$@"
+fi
+
+# ---------- classify the subcommand BEFORE running (argv is cheap) ----------
+# Skip global flags (-C path, -c k=v, --git-dir=…) to find the real subcommand.
+_dg_event=""
+_dg_sub=""
+_dg_args=("$@")
+_dg_i=0
+while (( _dg_i < ${#_dg_args[@]} )); do
+  a="${_dg_args[$_dg_i]}"
+  case "$a" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path)
+      _dg_i=$(( _dg_i + 2 )); continue ;;
+    --*=*|--no-pager|--paginate|--bare|--literal-pathspecs|-P)
+      _dg_i=$(( _dg_i + 1 )); continue ;;
+    -*)
+      _dg_i=$(( _dg_i + 1 )); continue ;;
+    *)
+      _dg_sub="$a"; break ;;
+  esac
+done
+
+# Second word, for `worktree add` / `stash push` style subcommands.
+_dg_sub2="${_dg_args[$(( _dg_i + 1 ))]:-}"
+
+case "$_dg_sub" in
+  add)       _dg_event="add" ;;
+  commit)    _dg_event="commit" ;;
+  push)      _dg_event="push" ;;
+  pull)      _dg_event="pull" ;;
+  fetch)     _dg_event="fetch" ;;
+  merge)     _dg_event="merge" ;;
+  rebase)    _dg_event="rebase" ;;
+  checkout|switch) _dg_event="checkout" ;;
+  branch)    _dg_event="branch" ;;
+  clone)     _dg_event="clone" ;;
+  tag)       _dg_event="tag" ;;
+  reset)     _dg_event="reset" ;;
+  revert)    _dg_event="revert" ;;
+  stash)     _dg_event="stash" ;;
+  worktree)
+    case "$_dg_sub2" in
+      add)          _dg_event="worktree-add" ;;
+      remove|prune) _dg_event="worktree-remove" ;;
+    esac ;;
+esac
+
+# Read-only subcommands never make noise, no matter what.
+case "$_dg_sub" in
+  status|log|diff|show|rev-parse|config|ls-files|cat-file|for-each-ref|\
+  symbolic-ref|describe|blame|grep|shortlog|reflog|var|help|version|check-ignore)
+    exec "$REAL_GIT" "$@" ;;
+esac
+
+# ---------- capture context BEFORE the command, so it survives ----------
+# `git checkout` changes the branch; `clone` creates the repo. Grab what we can
+# now, and re-read after for the cases where the post-state is what matters.
+_dg_repo=""
+_dg_branch=""
+if [[ -n "$_dg_event" ]]; then
+  _dg_repo="$(SFX_IN_SHIM=1 "$REAL_GIT" rev-parse --show-toplevel 2>/dev/null)"
+  _dg_repo="${_dg_repo##*/}"
+fi
+
+# ---------- run the real thing, fully transparent ----------
+"$REAL_GIT" "$@"
+_dg_rc=$?
+
+# ---------- announce, only on success, never blocking ----------
+if (( _dg_rc == 0 )) && [[ -n "$_dg_event" ]]; then
+  {
+    # Post-state is the interesting one for branch-changing commands.
+    _dg_branch="$(SFX_IN_SHIM=1 "$REAL_GIT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [[ -z "$_dg_repo" ]] && {
+      _dg_repo="$(SFX_IN_SHIM=1 "$REAL_GIT" rev-parse --show-toplevel 2>/dev/null)"
+      _dg_repo="${_dg_repo##*/}"
+    }
+    # For `worktree add <path>`, the path is the interesting name.
+    if [[ "$_dg_event" == "worktree-add" ]]; then
+      for a in "${_dg_args[@]:$(( _dg_i + 2 ))}"; do
+        [[ "$a" == -* ]] && continue
+        _dg_branch="${a##*/}"; break
+      done
+    fi
+    SFX_IN_SHIM=1 sfx play "$_dg_event" \
+      --repo "${_dg_repo:-repo}" --branch "${_dg_branch:-}" >/dev/null 2>&1
+  } &
+  disown 2>/dev/null
+fi
+
+exit $_dg_rc
