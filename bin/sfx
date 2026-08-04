@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# sfx — dopamine-git: hear what git is doing, including when an agent does it.
+#
+# Two ways to make noise, per event:
+#
+#   voice   speak it   "danko-help, committed on main"   (piper TTS, cached)
+#   sound   play it    a clip from the active pack
+#
+# A pack is just a folder of audio files named after events:
+#
+#   my-pack/push.ogg
+#   my-pack/commit.mp3
+#   my-pack/test-fail/*.wav     <- a folder = pick one at random
+#
+# That's the whole format. pack.json is optional metadata, never required.
+#
+# Usage:
+#   sfx play <event> [--repo R] [--branch B]   Announce an event
+#   sfx test [event]                           Confirm your audio works
+#   sfx events                                 Show events and their modes
+#   sfx mode <event> voice|sound|off           Change how one event announces
+#   sfx say "<text>"                           Speak arbitrary text now
+#   sfx pack list|use|init|dir                 Manage sound packs
+#   sfx add <event> <url|file>                 Grab audio into a pack
+#   sfx volume [0.0-1.0]                       Get or set volume
+#   sfx mute | unmute                          Toggle everything
+#   sfx doctor                                 Diagnose a silent setup
+#
+# Env:
+#   SFX_MUTE=1      mute everything      SFX_PACK=name   override active pack
+#   SFX_HOME        override data dir    SFX_DEBUG=1     log to stderr
+
+set -uo pipefail
+
+VERSION="0.1.0"
+
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}"
+SFX_HOME="${SFX_HOME:-$XDG_DATA/dopamine-git}"
+PACKS_DIR="$SFX_HOME/packs"
+CACHE_DIR="$SFX_HOME/voice-cache"
+CONF_DIR="$XDG_CONF/dopamine-git"
+CONF="$CONF_DIR/config"
+MUTE_FLAG="$SFX_HOME/.muted"
+
+# Resolve through symlinks: an install may symlink ~/.local/bin/sfx at a checkout,
+# and the bundled packs live next to the *real* script, not next to the link.
+_self_src="${BASH_SOURCE[0]}"
+while [[ -L "$_self_src" ]]; do
+  _self_dir="$(cd -P "$(dirname "$_self_src")" && pwd)"
+  _self_src="$(readlink "$_self_src")"
+  [[ "$_self_src" != /* ]] && _self_src="$_self_dir/$_self_src"
+done
+SELF="$(cd -P "$(dirname "$_self_src")" && pwd)"
+BUNDLED_PACKS="$SELF/../packs"
+
+AUDIO_EXT=(ogg oga mp3 wav opus flac m4a)
+
+# event : default-mode : default-phrase
+# Chatty events (add/checkout) default to a quiet tone or off, because an agent
+# fires them constantly and a talking terminal gets old in about ninety seconds.
+EVENT_SPEC="
+add:off:{repo}, staged
+commit:voice:{repo}, committed[ on {branch}]
+push:voice:{repo}, pushed[ to {branch}]
+pull:sound:{repo}, pulled
+fetch:off:{repo}, fetched
+merge:voice:{repo}, merged[ into {branch}]
+rebase:voice:{repo}, rebased
+checkout:sound:{repo}, switched to {branch}
+branch:sound:{repo}, branch {branch}
+worktree-add:voice:{repo}, new worktree[ {branch}]
+worktree-remove:sound:{repo}, worktree removed
+stash:sound:{repo}, stashed
+tag:sound:{repo}, tagged
+clone:voice:cloned {repo}
+reset:sound:{repo}, reset
+revert:voice:{repo}, reverted
+error:sound:{repo}, git failed
+test-pass:sound:tests passed
+test-fail:sound:tests failed
+celebration:sound:nice
+"
+
+die()  { printf 'sfx: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+dbg()  { [[ "${SFX_DEBUG:-0}" == "1" ]] && printf 'sfx[dbg]: %s\n' "$*" >&2; return 0; }
+
+all_events()   { printf '%s' "$EVENT_SPEC" | awk -F: 'NF{print $1}'; }
+spec_field()   { printf '%s' "$EVENT_SPEC" | awk -F: -v e="$1" -v n="$2" '$1==e{print $n; exit}'; }
+def_mode()     { spec_field "$1" 2; }
+def_phrase()   { printf '%s' "$EVENT_SPEC" | awk -F: -v e="$1" '$1==e{sub(/^[^:]*:[^:]*:/,""); print; exit}'; }
+
+# ---------- config: plain KEY=VALUE, no jq needed on the hot path ----------
+conf_get() {
+  local key="$1" def="${2:-}" val=""
+  [[ -f "$CONF" ]] && val=$(sed -n "s/^${key}=//p" "$CONF" | tail -1)
+  printf '%s' "${val:-$def}"
+}
+
+conf_set() {
+  local key="$1" val="$2" tmp
+  mkdir -p "$CONF_DIR"; touch "$CONF"
+  if grep -q "^${key}=" "$CONF" 2>/dev/null; then
+    tmp=$(mktemp); sed "s|^${key}=.*|${key}=${val}|" "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$CONF"
+  fi
+}
+
+active_pack() { printf '%s' "${SFX_PACK:-$(conf_get pack default)}"; }
+volume()      { conf_get volume 0.85; }
+voice_model() { conf_get voice en_US-kristin-medium; }
+event_mode()  { conf_get "mode.$1" "$(def_mode "$1")"; }
+event_phrase(){ conf_get "phrase.$1" "$(def_phrase "$1")"; }
+
+is_muted() {
+  [[ "${SFX_MUTE:-0}" == "1" ]] && return 0
+  [[ -f "$MUTE_FLAG" ]] && return 0
+  return 1
+}
+
+# ---------- packs ----------
+pack_path() {
+  local n="$1"
+  if   [[ -d "$PACKS_DIR/$n"      ]]; then printf '%s' "$PACKS_DIR/$n"
+  elif [[ -d "$BUNDLED_PACKS/$n"  ]]; then printf '%s' "$BUNDLED_PACKS/$n"
+  else return 1; fi
+}
+
+all_packs() {
+  { [[ -d "$PACKS_DIR"     ]] && find "$PACKS_DIR"     -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null
+    [[ -d "$BUNDLED_PACKS" ]] && find "$BUNDLED_PACKS" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null
+  } | sort -u
+}
+
+is_audio() { case "${1##*.}" in ogg|oga|mp3|wav|opus|flac|m4a) return 0;; *) return 1;; esac; }
+
+# Convention only: <event>.<ext>, <event>/*.<ext>, <event>-*.<ext>
+collect_sounds() {
+  local dir="$1" event="$2" ext f
+  [[ -d "$dir" ]] || return 0
+  for ext in "${AUDIO_EXT[@]}"; do
+    [[ -f "$dir/$event.$ext" ]] && printf '%s\n' "$dir/$event.$ext"
+  done
+  if [[ -d "$dir/$event" ]]; then
+    while IFS= read -r f; do is_audio "$f" && printf '%s\n' "$f"; done \
+      < <(find "$dir/$event" -maxdepth 1 -type f 2>/dev/null)
+  fi
+  while IFS= read -r f; do is_audio "$f" && printf '%s\n' "$f"; done \
+    < <(find "$dir" -maxdepth 1 -type f -name "$event-*" 2>/dev/null)
+}
+
+pick_sound() {
+  local event="$1" pack pdir pool=()
+  pack="$(active_pack)"
+  if pdir="$(pack_path "$pack")"; then
+    while IFS= read -r f; do [[ -n "$f" ]] && pool+=("$f"); done < <(collect_sounds "$pdir" "$event")
+  fi
+  # A half-finished custom pack still makes noise, via default.
+  if [[ ${#pool[@]} -eq 0 && "$pack" != "default" ]]; then
+    if pdir="$(pack_path default)"; then
+      while IFS= read -r f; do [[ -n "$f" ]] && pool+=("$f"); done < <(collect_sounds "$pdir" "$event")
+    fi
+  fi
+  [[ ${#pool[@]} -eq 0 ]] && return 1
+  printf '%s' "${pool[RANDOM % ${#pool[@]}]}"
+}
+
+# ---------- playback ----------
+play_file() {
+  local file="$1" vol="$2"
+  if   have pw-play; then pw-play --volume="$vol" "$file" >/dev/null 2>&1
+  elif have paplay;  then paplay --volume "$(awk -v v="$vol" 'BEGIN{if(v<0)v=0;if(v>1)v=1;printf("%d",v*65536)}')" "$file" >/dev/null 2>&1
+  elif have afplay;  then afplay -v "$vol" "$file" >/dev/null 2>&1
+  elif have ffplay;  then ffplay -nodisp -autoexit -loglevel quiet -volume "$(awk -v v="$vol" 'BEGIN{printf("%d",v*100)}')" "$file" >/dev/null 2>&1
+  elif have play;    then play -q -v "$vol" "$file" >/dev/null 2>&1
+  elif have aplay && [[ "$file" == *.wav ]]; then aplay -q "$file" >/dev/null 2>&1
+  else return 127; fi
+}
+
+# ---------- voice (piper TTS, cached so repeats are instant) ----------
+speak_file() {
+  local text="$1" model key out
+  have piper || return 1
+  model="$XDG_DATA/piper-voices/$(voice_model).onnx"
+  [[ -f "$model" ]] || { dbg "voice model missing: $model"; return 1; }
+
+  key=$(printf '%s|%s' "$(voice_model)" "$text" | cksum | tr -d ' ')
+  out="$CACHE_DIR/$key.wav"
+  if [[ ! -s "$out" ]]; then
+    mkdir -p "$CACHE_DIR"
+    printf '%s\n' "$text" | piper --model "$model" --output_file "$out" >/dev/null 2>&1 \
+      || { rm -f "$out"; return 1; }
+  fi
+  [[ -s "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# Phrases may wrap a clause in [...] to mark it optional: the clause is dropped
+# whole if the placeholder inside it has no value. Without this you get
+# "pushed to HEAD" on an unborn branch, or a dangling "committed on ".
+render_phrase() {
+  local event="$1" repo="$2" branch="$3" p
+  p="$(event_phrase "$event")"
+
+  # An unborn or detached HEAD is not a branch name worth saying out loud.
+  [[ "$branch" == "HEAD" ]] && branch=""
+
+  # Drop optional clauses whose placeholder is empty, then unwrap the rest.
+  [[ -z "$branch" ]] && while [[ "$p" =~ \[[^][]*\{branch\}[^][]*\] ]]; do
+    p="${p/"${BASH_REMATCH[0]}"/}"
+  done
+  [[ -z "$repo" ]] && while [[ "$p" =~ \[[^][]*\{repo\}[^][]*\] ]]; do
+    p="${p/"${BASH_REMATCH[0]}"/}"
+  done
+  p="${p//[/}"; p="${p//]/}"
+
+  p="${p//\{repo\}/$repo}"
+  p="${p//\{branch\}/$branch}"
+  p="${p//\{event\}/$event}"
+
+  # Tidy up whatever the substitutions left behind.
+  p="$(printf '%s' "$p" | tr -s ' ')"
+  p="${p%"${p##*[![:space:],]}"}"
+  printf '%s' "$p"
+}
+
+# ---------- play ----------
+cmd_play() {
+  local event="${1:-}" repo="" branch="" dry=0
+  [[ -z "$event" ]] && die "usage: sfx play <event> [--repo R] [--branch B]"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)   repo="$2";   shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) shift ;;   # tolerate junk: never break a git command over a bad flag
+    esac
+  done
+
+  is_muted && exit 0
+
+  local mode; mode="$(event_mode "$event")"
+  [[ "$mode" == "off" ]] && { dbg "$event is off"; exit 0; }
+
+  # Fill in context ourselves if the caller did not.
+  [[ -z "$repo"   ]] && repo="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
+  [[ -z "$branch" ]] && branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+
+  # Dedup: shim + hook can both fire for one action.
+  local lock="/tmp/sfx-${USER:-u}-${event}.lock" now age
+  now=$(date +%s)
+  if [[ -f "$lock" ]]; then
+    age=$(( now - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo 0) ))
+    (( age < 2 )) && { dbg "dedup $event"; exit 0; }
+  fi
+  touch "$lock" 2>/dev/null || true
+
+  local file="" text=""
+  if [[ "$mode" == "voice" ]]; then
+    text="$(render_phrase "$event" "$repo" "$branch")"
+    file="$(speak_file "$text")" || file=""
+    [[ -z "$file" ]] && { dbg "voice failed, falling back to sound"; file="$(pick_sound "$event")" || file=""; }
+  else
+    file="$(pick_sound "$event")" || file=""
+  fi
+  [[ -z "$file" ]] && exit 0   # silence is never an error
+
+  if (( dry )); then printf 'would play: %s%s\n' "$file" "${text:+  ($text)}"; exit 0; fi
+  ( play_file "$file" "$(volume)" & disown ) 2>/dev/null
+  exit 0
+}
+
+# ---------- pack management ----------
+cmd_pack() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)
+      local active; active="$(active_pack)"; local any=0 p dir n mark src
+      while read -r p; do
+        [[ -z "$p" ]] && continue
+        any=1; dir="$(pack_path "$p")"
+        n=$(for e in $(all_events); do collect_sounds "$dir" "$e"; done | wc -l)
+        mark=" "; [[ "$p" == "$active" ]] && mark="*"
+        src="user"; [[ "$dir" == "$BUNDLED_PACKS/"* ]] && src="bundled"
+        printf ' %s %-18s %3d sound(s)  [%s]\n' "$mark" "$p" "$n" "$src"
+      done < <(all_packs)
+      (( any )) || echo "no packs — try: sfx pack init mine"
+      ;;
+    use)
+      local n="${1:-}"; [[ -z "$n" ]] && die "usage: sfx pack use <name>"
+      pack_path "$n" >/dev/null || die "no such pack: $n (see: sfx pack list)"
+      conf_set pack "$n"; echo "✓ active pack → $n" ;;
+    init)
+      local n="${1:-}"; [[ -z "$n" ]] && die "usage: sfx pack init <name>"
+      local dir="$PACKS_DIR/$n"
+      [[ -d "$dir" ]] && die "pack exists: $dir"
+      mkdir -p "$dir"
+      printf '{\n  "name": "%s",\n  "description": "",\n  "author": "",\n  "license": "",\n  "source": ""\n}\n' "$n" > "$dir/pack.json"
+      { echo "# $n"
+        echo
+        echo "A dopamine-git sound pack. Drop audio files in here, named after events:"
+        echo
+        echo '    push.ogg          plays on a successful git push'
+        echo '    commit.mp3        plays on a commit'
+        echo '    merge/*.wav       a folder = one picked at random'
+        echo
+        echo "Events: $(all_events | tr '\n' ' ')"
+        echo
+        echo "Any of .ogg .oga .mp3 .wav .opus .flac .m4a. No build step, no config."
+        echo
+        echo "    sfx pack use $n"
+      } > "$dir/README.md"
+      echo "✓ created $dir"
+      echo "  drop in files named after events, then: sfx pack use $n" ;;
+    dir)
+      local n="${1:-$(active_pack)}" d
+      d="$(pack_path "$n")" || die "no such pack: $n"; printf '%s\n' "$d" ;;
+    *) die "usage: sfx pack {list|use|init|dir}" ;;
+  esac
+}
+
+# ---------- add ----------
+cmd_add() {
+  local event="${1:-}" src="${2:-}"
+  [[ -z "$event" || -z "$src" ]] && \
+    die "usage: sfx add <event> <url|file> [--start MM:SS] [--end MM:SS] [--pack NAME] [--name NAME]"
+  shift 2
+  have ffmpeg || die "missing dep: ffmpeg"
+  local start="" end="" pack="" name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --start) start="$2"; shift 2 ;; --end) end="$2"; shift 2 ;;
+      --pack)  pack="$2";  shift 2 ;; --name) name="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ -z "$pack" ]] && pack="$(active_pack)"
+  [[ "$pack" == "default" ]] && die "refusing to write into the bundled 'default' pack — run: sfx pack init mine"
+  local dest_dir="$PACKS_DIR/$pack/$event"; mkdir -p "$dest_dir"
+  [[ -z "$name" ]] && name="clip-$(date +%s)"
+  local dest="$dest_dir/$name.ogg"
+  local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  local raw=""
+  if [[ -f "$src" ]]; then raw="$src"
+  else
+    have yt-dlp || die "missing dep: yt-dlp (to pull audio from a URL)"
+    echo "→ downloading …"
+    yt-dlp -q -x --audio-format wav --no-playlist -o "$tmp/in.%(ext)s" "$src" || die "download failed"
+    raw=$(find "$tmp" -name 'in.*' | head -1)
+  fi
+  [[ -n "$raw" ]] || die "nothing to encode"
+  local trim=(); [[ -n "$start" ]] && trim+=(-ss "$start"); [[ -n "$end" ]] && trim+=(-to "$end")
+  echo "→ encoding → $dest"
+  ffmpeg -hide_banner -loglevel error -y "${trim[@]}" -i "$raw" -ac 2 -ar 44100 \
+    -af "loudnorm=I=-16:TP=-1.5:LRA=11" -c:a libvorbis -q:a 4 "$dest" || die "encode failed"
+  conf_set "mode.$event" sound
+  echo "✓ added to pack '$pack' (mode.$event → sound)"
+  echo "  hear it: sfx play $event"
+  echo
+  echo "  Audio from the internet is usually someone else's. Keep it local, or"
+  echo "  check the license before publishing a pack."
+}
+
+# ---------- say / modes / misc ----------
+cmd_say() {
+  local text="${*:-}"; [[ -z "$text" ]] && die "usage: sfx say \"<text>\""
+  local f; f="$(speak_file "$text")" || die "piper unavailable or voice model missing — see: sfx doctor"
+  play_file "$f" "$(volume)" || die "no audio player — see: sfx doctor"
+}
+
+cmd_mode() {
+  local event="${1:-}" mode="${2:-}"
+  [[ -z "$event" ]] && die "usage: sfx mode <event> voice|sound|off"
+  all_events | grep -qx "$event" || die "unknown event: $event (see: sfx events)"
+  [[ -z "$mode" ]] && { event_mode "$event"; echo; exit 0; }
+  case "$mode" in voice|sound|off) ;; *) die "mode must be voice, sound, or off" ;; esac
+  conf_set "mode.$event" "$mode"
+  echo "✓ $event → $mode"
+}
+
+cmd_events() {
+  local pack dir e m n
+  pack="$(active_pack)"; dir="$(pack_path "$pack" || true)"
+  printf 'active pack: %s      voice: %s\n\n' "$pack" "$(voice_model)"
+  printf '  %-16s %-6s %-8s %s\n' EVENT MODE CLIPS PHRASE
+  for e in $(all_events); do
+    m="$(event_mode "$e")"; n=0
+    [[ -n "$dir" ]] && n=$(collect_sounds "$dir" "$e" | wc -l)
+    printf '  %-16s %-6s %-8s %s\n' "$e" "$m" "$n" "$(event_phrase "$e")"
+  done
+  echo
+  echo "change one with: sfx mode <event> voice|sound|off"
+}
+
+cmd_test() {
+  local event="${1:-commit}"
+  is_muted && { echo "muted — run: sfx unmute"; exit 0; }
+  local mode; mode="$(event_mode "$event")"
+  [[ "$mode" == "off" ]] && mode="voice"
+  local file text
+  if [[ "$mode" == "voice" ]]; then
+    text="$(render_phrase "$event" "$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)")"
+    printf '→ speaking: "%s"\n' "$text"
+    file="$(speak_file "$text")" || die "piper unavailable — see: sfx doctor"
+  else
+    file="$(pick_sound "$event")" || die "no sound for '$event' in pack '$(active_pack)'"
+    printf '→ %s\n' "$file"
+  fi
+  play_file "$file" "$(volume)" || die "no audio player found — see: sfx doctor"
+  echo "✓ if you heard that, you're set"
+}
+
+cmd_volume() {
+  local v="${1:-}"
+  [[ -z "$v" ]] && { volume; echo; exit 0; }
+  awk -v v="$v" 'BEGIN{ exit !(v ~ /^[0-9]*\.?[0-9]+$/ && v >= 0 && v <= 1) }' \
+    || die "volume must be 0.0–1.0"
+  conf_set volume "$v"; echo "✓ volume → $v"
+}
+
+cmd_doctor() {
+  echo "dopamine-git $VERSION"; echo
+  printf 'data dir     %s%s\n' "$SFX_HOME" "$([[ -d $SFX_HOME ]] || echo '  (missing)')"
+  printf 'config       %s%s\n' "$CONF" "$([[ -f $CONF ]] || echo '  (none — defaults)')"
+  printf 'active pack  %s\n' "$(active_pack)"
+  pack_path "$(active_pack)" >/dev/null || echo '             ⚠ not found on disk'
+  printf 'muted        %s\n' "$(is_muted && echo yes || echo no)"
+  printf 'volume       %s\n' "$(volume)"
+  echo
+  local p found=""
+  for p in pw-play paplay afplay ffplay play aplay; do have "$p" && { found="$p"; break; }; done
+  if [[ -n "$found" ]]; then printf 'player       %s ✓\n' "$found"
+  else echo 'player       ✗ none — install pipewire, pulseaudio-utils, sox, or ffmpeg'; fi
+  local vm="$XDG_DATA/piper-voices/$(voice_model).onnx"
+  if have piper && [[ -f "$vm" ]]; then printf 'voice        %s ✓\n' "$(voice_model)"
+  elif have piper; then printf 'voice        ✗ model missing: %s\n' "$vm"
+  else echo 'voice        – piper not installed (sound mode still works)'; fi
+  printf 'cache        %s (%s)\n' "$CACHE_DIR" "$(find "$CACHE_DIR" -name '*.wav' 2>/dev/null | wc -l) clips"
+  for p in ffmpeg yt-dlp jq; do printf '%-12s %s\n' "$p" "$(have "$p" && echo '✓' || echo '– (optional)')"; done
+  echo
+  # The whole point is hearing agents, so check the shim specifically.
+  local real_git shim_git
+  shim_git="$(command -v git 2>/dev/null)"
+  printf 'git resolves %s\n' "$shim_git"
+  if [[ -n "$shim_git" ]] && grep -qs 'dopamine-git' "$shim_git" 2>/dev/null; then
+    echo '             ✓ shim active — agent git calls will be heard'
+  else
+    echo '             ✗ shim NOT active — you will only hear git you type yourself'
+    echo '               install it: ./install.sh'
+  fi
+  real_git="$(zsh -c 'command -v git' 2>/dev/null || bash -c 'command -v git' 2>/dev/null)"
+  printf 'non-interactive shell sees: %s\n' "${real_git:-unknown}"
+}
+
+cmd_mute()   { mkdir -p "$SFX_HOME"; touch "$MUTE_FLAG"; echo "✓ muted (undo: sfx unmute)"; }
+cmd_unmute() { rm -f "$MUTE_FLAG"; echo "✓ unmuted"; }
+
+usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    play)   cmd_play "$@" ;;   test)   cmd_test "$@" ;;
+    events) cmd_events "$@" ;; mode)   cmd_mode "$@" ;;
+    pack)   cmd_pack "$@" ;;   add)    cmd_add "$@" ;;
+    say)    cmd_say "$@" ;;    volume) cmd_volume "$@" ;;
+    mute)   cmd_mute ;;        unmute) cmd_unmute ;;
+    doctor) cmd_doctor ;;
+    version|--version|-V) echo "$VERSION" ;;
+    ""|help|-h|--help)    usage ;;
+    *) die "unknown subcommand: $sub (try: sfx help)" ;;
+  esac
+}
+main "$@"
