@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # install.sh — put sfx and the git shim on your PATH.
 #
-# Installs symlinks, so `git pull` in this checkout updates your install.
+# COPIES by default. It is tempting to symlink into this checkout so `git pull`
+# updates your install, but the shim IS your git: if you ever check out a branch
+# where bin/git does not exist, the symlink dangles and git breaks machine-wide
+# until you check it back out. That is a bad day, and it is not hypothetical --
+# it happened while building this.
+#
+#   ./install.sh            copy (safe, recommended)
+#   ./install.sh --link     symlink (for developing on dopamine-git itself)
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 BIN="${DOPAMINE_GIT_BIN:-$HOME/.local/bin}"
+MODE="copy"
+[[ "${1:-}" == "--link" ]] && MODE="link"
 
 say() { printf '%s\n' "$*"; }
 
@@ -27,9 +36,20 @@ if [[ -f "$BIN/sfx" && ! -L "$BIN/sfx" ]]; then
   say "• backed up your existing sfx → $BIN/sfx.pre-dopamine-git.bak"
 fi
 
-ln -sfn "$SRC/bin/sfx" "$BIN/sfx"
-ln -sfn "$SRC/bin/git" "$BIN/git"
-say "✓ installed to $BIN"
+if [[ "$MODE" == "link" ]]; then
+  ln -sfn "$SRC/bin/sfx" "$BIN/sfx"
+  ln -sfn "$SRC/bin/git" "$BIN/git"
+  say "✓ linked into $BIN (dev mode — keep this checkout intact, or git breaks)"
+else
+  # Copy sfx first: the shim calls it, so it should never be the missing half.
+  install -m 755 "$SRC/bin/sfx" "$BIN/sfx.tmp$$" && mv -f "$BIN/sfx.tmp$$" "$BIN/sfx"
+  install -m 755 "$SRC/bin/git" "$BIN/git.tmp$$" && mv -f "$BIN/git.tmp$$" "$BIN/git"
+  # Packs live beside the real script, so they have to come along.
+  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/dopamine-git"
+  mkdir -p "$DATA/packs"
+  cp -r "$SRC/packs/." "$DATA/packs/"
+  say "✓ installed to $BIN (packs → $DATA/packs)"
+fi
 
 # Verify PATH order — a shim behind the real git is a silent no-op.
 case ":$PATH:" in

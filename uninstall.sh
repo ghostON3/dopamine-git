@@ -5,15 +5,22 @@ set -euo pipefail
 BIN="${DOPAMINE_GIT_BIN:-$HOME/.local/bin}"
 say() { printf '%s\n' "$*"; }
 
+# Remove the shim before the CLI: while the shim exists without sfx it still
+# works (it swallows the failure), but never leave a shim pointing at nothing.
 for f in git sfx; do
   if [[ -L "$BIN/$f" ]]; then
     target="$(readlink "$BIN/$f")"
     case "$target" in
-      *dopamine-git*) rm -f "$BIN/$f"; say "✓ removed $BIN/$f" ;;
+      *dopamine-git*) rm -f "$BIN/$f"; say "✓ removed $BIN/$f (symlink)" ;;
       *) say "• left $BIN/$f alone (points at $target, not ours)" ;;
     esac
-  elif [[ -e "$BIN/$f" ]]; then
-    say "• left $BIN/$f alone (not a symlink we created)"
+  elif [[ -f "$BIN/$f" ]]; then
+    # Only delete a copy we can positively identify as ours.
+    if grep -q 'dopamine-git' "$BIN/$f" 2>/dev/null; then
+      rm -f "$BIN/$f"; say "✓ removed $BIN/$f"
+    else
+      say "• left $BIN/$f alone (not ours)"
+    fi
   fi
 done
 
