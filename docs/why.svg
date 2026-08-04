@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="fade" x1="0" x2="1">
+      <stop offset="0" stop-color="#58a6ff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#58a6ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="fadeG" x1="0" x2="1">
+      <stop offset="0" stop-color="#3fb950" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#3fb950" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="640" fill="#0d1117"/>
+
+  <!-- ── title ─────────────────────────────────────────────────────────── -->
+  <text x="60" y="62" fill="#e6edf3" font-size="30" font-weight="700">Four agents are working. You have one pair of eyes.</text>
+  <text x="60" y="96" fill="#8b949e" font-size="17">Vision is a single-focus channel. Hearing is parallel by default — so route the parallel work to your ears.</text>
+
+  <line x1="600" y1="140" x2="600" y2="500" stroke="#21262d" stroke-width="2"/>
+
+  <!-- ══ LEFT: the visual channel ══════════════════════════════════════ -->
+  <text x="60" y="152" fill="#f85149" font-size="13" font-weight="700" letter-spacing="1.5">WATCHING — SERIAL</text>
+
+  <!-- pane 1: focused -->
+  <rect x="60" y="176" width="230" height="120" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+  <circle cx="78" cy="194" r="4" fill="#3fb950"/>
+  <text x="92" y="199" fill="#e6edf3" font-size="13" font-weight="600">elo-v2</text>
+  <text x="76" y="226" fill="#8b949e" font-size="11" font-family="ui-monospace, monospace">$ git commit -m "fix auth"</text>
+  <text x="76" y="246" fill="#8b949e" font-size="11" font-family="ui-monospace, monospace">[main 3f2a1c] 4 files</text>
+  <text x="76" y="272" fill="#58a6ff" font-size="11" font-weight="600">◉ you are looking here</text>
+
+  <!-- panes 2-4: unattended -->
+  <g opacity="0.42">
+    <rect x="310" y="176" width="230" height="120" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <circle cx="328" cy="194" r="4" fill="#8b949e"/>
+    <text x="342" y="199" fill="#8b949e" font-size="13" font-weight="600">strojx</text>
+    <text x="380" y="252" fill="#6e7681" font-size="34" font-weight="700">?</text>
+  </g>
+  <g opacity="0.42">
+    <rect x="60" y="316" width="230" height="120" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <circle cx="78" cy="334" r="4" fill="#8b949e"/>
+    <text x="92" y="339" fill="#8b949e" font-size="13" font-weight="600">danko-help</text>
+    <text x="130" y="392" fill="#6e7681" font-size="34" font-weight="700">?</text>
+  </g>
+  <g opacity="0.42">
+    <rect x="310" y="316" width="230" height="120" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <circle cx="328" cy="334" r="4" fill="#8b949e"/>
+    <text x="342" y="339" fill="#8b949e" font-size="13" font-weight="600">snap-extract</text>
+    <text x="380" y="392" fill="#6e7681" font-size="34" font-weight="700">?</text>
+  </g>
+
+  <text x="60" y="474" fill="#f85149" font-size="15" font-weight="600">3 of 4 unobserved, always.</text>
+  <text x="60" y="498" fill="#8b949e" font-size="13">Switching panes costs attention and still leaves three blind.</text>
+
+  <!-- ══ RIGHT: the auditory channel ═══════════════════════════════════ -->
+  <text x="656" y="152" fill="#3fb950" font-size="13" font-weight="700" letter-spacing="1.5">LISTENING — PARALLEL</text>
+
+  <!-- listener: concentric arcs read as "sound arriving" far better than an ear glyph -->
+  <g transform="translate(1062,283)" fill="none" stroke="#3fb950" stroke-linecap="round">
+    <circle cx="0" cy="0" r="7" fill="#3fb950" stroke="none"/>
+    <path d="M 8,-14 A 18,18 0 0 1 8,14"  stroke-width="3.5"/>
+    <path d="M 20,-26 A 34,34 0 0 1 20,26" stroke-width="3.5" opacity="0.72"/>
+    <path d="M 32,-38 A 50,50 0 0 1 32,38" stroke-width="3.5" opacity="0.44"/>
+  </g>
+  <text x="1062" y="366" fill="#8b949e" font-size="13" text-anchor="middle">you</text>
+
+  <!-- four simultaneous streams -->
+  <g font-size="13">
+    <rect x="656" y="182" width="300" height="34" rx="17" fill="#161b22" stroke="#30363d"/>
+    <circle cx="676" cy="199" r="4" fill="#3fb950"/>
+    <text x="692" y="204" fill="#e6edf3">“elo-v2, committed on main”</text>
+    <path d="M 960 199 H 1010" stroke="url(#fadeG)" stroke-width="3" stroke-linecap="round"/>
+
+    <rect x="656" y="238" width="300" height="34" rx="17" fill="#161b22" stroke="#30363d"/>
+    <circle cx="676" cy="255" r="4" fill="#58a6ff"/>
+    <text x="692" y="260" fill="#e6edf3">“strojx, new worktree slot-4”</text>
+    <path d="M 960 255 H 1010" stroke="url(#fade)" stroke-width="3" stroke-linecap="round"/>
+
+    <rect x="656" y="294" width="300" height="34" rx="17" fill="#161b22" stroke="#30363d"/>
+    <circle cx="676" cy="311" r="4" fill="#3fb950"/>
+    <text x="692" y="316" fill="#e6edf3">“danko-help, pushed to main”</text>
+    <path d="M 960 311 H 1010" stroke="url(#fadeG)" stroke-width="3" stroke-linecap="round"/>
+
+    <rect x="656" y="350" width="300" height="34" rx="17" fill="#161b22" stroke="#30363d"/>
+    <circle cx="676" cy="367" r="4" fill="#d29922"/>
+    <text x="692" y="372" fill="#e6edf3">“snap-extract, rebased”</text>
+    <path d="M 960 367 H 1010" stroke="url(#fade)" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <text x="656" y="474" fill="#3fb950" font-size="15" font-weight="600">All 4, without looking at any.</text>
+  <text x="656" y="498" fill="#8b949e" font-size="13">Each names its repo, so you know which one moved.</text>
+
+  <!-- ══ evidence strip ════════════════════════════════════════════════ -->
+  <rect x="60" y="536" width="1080" height="72" rx="10" fill="#161b22" stroke="#21262d"/>
+  <text x="84" y="564" fill="#8b949e" font-size="12.5">
+    <tspan fill="#e6edf3" font-weight="700">Multiple Resource Theory</tspan> (Wickens, 2008): vision and hearing draw on separate pools, so a task moved to
+  </text>
+  <text x="84" y="584" fill="#8b949e" font-size="12.5">
+    the auditory channel interferes less than a second visual one. <tspan fill="#e6edf3" font-weight="700">ARKola</tspan> (Gaver, Smith &amp; O’Shea, CHI ’91): operators tracked
+  </text>
+  <text x="84" y="600" fill="#8b949e" font-size="12.5" opacity="0">spacer</text>
+  <text x="84" y="600" fill="#8b949e" font-size="12.5">
+    nine machines by ear — including the ones off-screen — and sound let separate processes be perceived as one system.
+  </text>
+</svg>
